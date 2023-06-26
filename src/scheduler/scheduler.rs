@@ -5,11 +5,11 @@ use super::*;
 use crate::mmtk::MMTK;
 use crate::util::opaque_pointer::*;
 use crate::util::options::AffinityKind;
+use crate::util::rust_util::array_from_fn;
 use crate::vm::Collection;
 use crate::vm::{GCThreadContext, VMBinding};
 use crossbeam::deque::{self, Steal};
-use enum_map::Enum;
-use enum_map::{enum_map, EnumMap};
+use enum_map::{Enum, EnumMap};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,24 +37,12 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         let worker_group = WorkerGroup::new(num_workers);
 
         // Create work buckets for workers.
-        let mut work_buckets = enum_map! {
-            WorkBucketStage::Unconstrained => WorkBucket::new(true, worker_monitor.clone()),
-            WorkBucketStage::Prepare => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::Closure => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::SoftRefClosure => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::WeakRefClosure => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::FinalRefClosure => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::PhantomRefClosure => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::VMRefClosure => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::CalculateForwarding => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::SecondRoots => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::RefForwarding => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::FinalizableForwarding => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::VMRefForwarding => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::Compact => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::Release => WorkBucket::new(false, worker_monitor.clone()),
-            WorkBucketStage::Final => WorkBucket::new(false, worker_monitor.clone()),
-        };
+        // TODO: Replace `array_from_fn` with `std::array::from_fn` after bumping MSRV.
+        let mut work_buckets = EnumMap::from_array(array_from_fn(|stage_num| {
+            let stage = WorkBucketStage::from_usize(stage_num);
+            let active = stage == WorkBucketStage::Unconstrained;
+            WorkBucket::new(active, worker_monitor.clone())
+        }));
 
         // Set the open condition of each bucket.
         {
@@ -94,16 +82,12 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
 
     /// Create GC threads, including the controller thread and all workers.
     pub fn spawn_gc_threads(self: &Arc<Self>, mmtk: &'static MMTK<VM>, tls: VMThread) {
-        // Create the communication channel.
-        let (sender, receiver) = controller::channel::make_channel();
-
         // Spawn the controller thread.
         let coordinator_worker = GCWorker::new(
             mmtk,
             usize::MAX,
             self.clone(),
             true,
-            sender.clone(),
             self.coordinator_worker_shared.clone(),
             deque::Worker::new_fifo(),
         );
@@ -111,12 +95,11 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             mmtk,
             mmtk.plan.base().gc_requester.clone(),
             self.clone(),
-            receiver,
             coordinator_worker,
         );
         VM::VMCollection::spawn_gc_thread(tls, GCThreadContext::<VM>::Controller(gc_controller));
 
-        self.worker_group.spawn(mmtk, sender, tls)
+        self.worker_group.spawn(mmtk, tls)
     }
 
     /// Resolve the affinity of a thread.
@@ -307,13 +290,21 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
     }
 
     /// Check if all the work buckets are empty
-    pub(crate) fn all_activated_buckets_are_empty(&self) -> bool {
-        for bucket in self.work_buckets.values() {
-            if bucket.is_activated() && !bucket.is_drained() {
-                return false;
+    pub(crate) fn assert_all_activated_buckets_are_empty(&self) {
+        let mut error_example = None;
+        for (id, bucket) in self.work_buckets.iter() {
+            if bucket.is_activated() && !bucket.is_empty() {
+                error!("Work bucket {:?} is active but not empty!", id);
+                // This error can be hard to reproduce.
+                // If an error happens in the release build where logs are turned off,
+                // we should show at least one abnormal bucket in the panic message
+                // so that we still have some information for debugging.
+                error_example = Some(id);
             }
         }
-        true
+        if let Some(id) = error_example {
+            panic!("Some active buckets (such as {:?}) are not empty.", id);
+        }
     }
 
     /// Get a schedulable work packet without retry.
@@ -376,48 +367,13 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
     }
 
     fn poll_slow(&self, worker: &GCWorker<VM>) -> Box<dyn GCWork<VM>> {
-        // Note: The lock is released during `wait` in the loop.
-        let mut sync = self.worker_monitor.sync.lock().unwrap();
         loop {
             // Retry polling
             if let Some(work) = self.poll_schedulable_work(worker) {
                 return work;
             }
 
-            // Park this worker
-            let all_parked = sync.inc_parked_workers();
-
-            if all_parked {
-                // If all workers are parked, enter "group sleeping" and notify controller.
-                sync.group_sleep = true;
-                debug!("Entered group-sleeping state");
-                worker.sender.notify_all_workers_parked();
-            } else {
-                // Otherwise wait until notified.
-                // Note: The condition for this `cond.wait` is "more work is available".
-                // If this worker spuriously wakes up, then in the next loop iteration, the
-                // `poll_schedulable_work` invocation above will fail, and the worker will reach
-                // here and wait again.
-                sync = self.worker_monitor.cond.wait(sync).unwrap();
-            }
-
-            // Keep waiting if we have entered "group sleeping" state.
-            // The coordinator will let the worker leave the "group sleeping" state
-            // once the coordinator finished its work.
-            //
-            // Note: `wait_while` checks `sync.group_sleep` before actually starting to wait.
-            // This is expected because the controller may run so fast that it opened new buckets
-            // and unset `sync.group_sleep` before we even reached here.  If that happens, waiting
-            // blindly will result in all workers sleeping forever.  So we should always check
-            // `sync.group_sleep` before waiting.
-            sync = self
-                .worker_monitor
-                .cond
-                .wait_while(sync, |sync| sync.group_sleep)
-                .unwrap();
-
-            // Unpark this worker.
-            sync.dec_parked_workers();
+            self.worker_monitor.park_and_wait(worker);
         }
     }
 

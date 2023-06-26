@@ -210,13 +210,10 @@ impl<VM: VMBinding> WorkBucket<VM> {
             sentinel.take()
         };
         if let Some(work) = maybe_sentinel {
-            // We cannot call `self.add` now, because:
-            // 1.  The current function is called only when all workers parked, and we are holding
-            //     the monitor lock.  `self.add` also needs that lock to notify other workers.
-            //     Trying to lock it again will result in deadlock.
-            // 2.  After this function returns, the current worker will check if there is pending
-            //     work immediately, and notify other workers.
-            // So we can just "sneak" the sentinel work packet into the current bucket now.
+            // We don't need to call `self.add` because this function is called by the coordinator
+            // when workers are stopped.  We don't need to notify the workers because the
+            // coordinator will do that later.
+            // We can just "sneak" the sentinel work packet into the current bucket.
             self.queue.push(work);
             true
         } else {
@@ -232,6 +229,9 @@ pub enum WorkBucketStage {
     /// Preparation work.  Plans, spaces, GC workers, mutators, etc. should be prepared for GC at
     /// this stage.
     Prepare,
+    /// Clear the VO bit metadata.  Mainly used by ImmixSpace.
+    #[cfg(feature = "vo_bit")]
+    ClearVOBits,
     /// Compute the transtive closure following only strong references.
     Closure,
     /// Handle Java-style soft references, and potentially expand the transitive closure.
