@@ -156,8 +156,8 @@ impl<VM: VMBinding> Space<VM> for MarkSweepSpace<VM> {
         &self.pr
     }
 
-    fn initialize_sft(&self) {
-        self.common().initialize_sft(self.as_sft())
+    fn initialize_sft(&self, sft_map: &mut dyn crate::policy::sft_map::SFTMap) {
+        self.common().initialize_sft(self.as_sft(), sft_map)
     }
 
     fn common(&self) -> &CommonSpace<VM> {
@@ -241,9 +241,7 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
         queue: &mut Q,
         object: ObjectReference,
     ) -> ObjectReference {
-        if object.is_null() {
-            return object;
-        }
+        debug_assert!(!object.is_null());
         debug_assert!(
             self.in_space(object),
             "Cannot mark an object {} that was not alloced by free list allocator.",

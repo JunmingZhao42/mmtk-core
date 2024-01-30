@@ -2,7 +2,6 @@ use super::gc_work::SSGCWorkContext;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
-use crate::plan::global::GcStatus;
 use crate::plan::semispace::mutator::ALLOCATOR_MAPPING;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
@@ -13,39 +12,38 @@ use crate::scheduler::*;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::copy::*;
 use crate::util::heap::VMRequest;
-use crate::util::metadata::side_metadata::{SideMetadataContext, SideMetadataSanity};
+use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::opaque_pointer::VMWorkerThread;
 use crate::{plan::global::BasePlan, vm::VMBinding};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mmtk_macros::PlanTraceObject;
+use mmtk_macros::{HasSpaces, PlanTraceObject};
 
 use enum_map::EnumMap;
 
-#[derive(PlanTraceObject)]
+#[derive(HasSpaces, PlanTraceObject)]
 pub struct SemiSpace<VM: VMBinding> {
     pub hi: AtomicBool,
-    #[trace(CopySemantics::DefaultCopy)]
+    #[space]
+    #[copy_semantics(CopySemantics::DefaultCopy)]
     pub copyspace0: CopySpace<VM>,
-    #[trace(CopySemantics::DefaultCopy)]
+    #[space]
+    #[copy_semantics(CopySemantics::DefaultCopy)]
     pub copyspace1: CopySpace<VM>,
-    #[fallback_trace]
+    #[parent]
     pub common: CommonPlan<VM>,
 }
 
+/// The plan constraints for the semispace plan.
 pub const SS_CONSTRAINTS: PlanConstraints = PlanConstraints {
     moves_objects: true,
-    gc_header_bits: 2,
-    gc_header_words: 0,
-    num_specialized_scans: 1,
     max_non_los_default_alloc_bytes:
         crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
+    needs_prepare_mutator: false,
     ..PlanConstraints::default()
 };
 
 impl<VM: VMBinding> Plan for SemiSpace<VM> {
-    type VM = VM;
-
     fn constraints(&self) -> &'static PlanConstraints {
         &SS_CONSTRAINTS
     }
@@ -65,16 +63,7 @@ impl<VM: VMBinding> Plan for SemiSpace<VM> {
         }
     }
 
-    fn get_spaces(&self) -> Vec<&dyn Space<Self::VM>> {
-        let mut ret = self.common.get_spaces();
-        ret.push(&self.copyspace0);
-        ret.push(&self.copyspace1);
-        ret
-    }
-
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
-        self.base().set_collection_kind::<Self>(self);
-        self.base().set_gc_status(GcStatus::GcPrepare);
         scheduler.schedule_common_work::<SSGCWorkContext<VM>>(self);
     }
 
@@ -159,17 +148,7 @@ impl<VM: VMBinding> SemiSpace<VM> {
             common: CommonPlan::new(plan_args),
         };
 
-        // Use SideMetadataSanity to check if each spec is valid. This is also needed for check
-        // side metadata in extreme_assertions.
-        {
-            let mut side_metadata_sanity_checker = SideMetadataSanity::new();
-            res.common
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            res.copyspace0
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            res.copyspace1
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-        }
+        res.verify_side_metadata_sanity();
 
         res
     }

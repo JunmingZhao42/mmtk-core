@@ -1,4 +1,5 @@
 use super::freelist::*;
+use super::memory::MmapStrategy;
 use crate::util::address::Address;
 use crate::util::constants::*;
 use crate::util::conversions;
@@ -23,6 +24,7 @@ pub struct RawMemoryFreeList {
     grain: i32,
     current_units: i32,
     pages_per_block: i32,
+    strategy: MmapStrategy,
 }
 
 impl FreeList for RawMemoryFreeList {
@@ -92,6 +94,7 @@ impl RawMemoryFreeList {
         units: i32,
         grain: i32,
         heads: i32,
+        strategy: MmapStrategy,
     ) -> Self {
         debug_assert!(units <= MAX_UNITS && heads <= MAX_HEADS);
         debug_assert!(
@@ -107,12 +110,13 @@ impl RawMemoryFreeList {
             grain,
             current_units: 0,
             pages_per_block,
+            strategy,
         }
     }
 
     fn current_capacity(&self) -> i32 {
-        let list_blocks =
-            conversions::bytes_to_pages(self.high_water - self.base) as i32 / self.pages_per_block;
+        let list_blocks = conversions::bytes_to_pages_up(self.high_water - self.base) as i32
+            / self.pages_per_block;
         self.units_in_first_block() + (list_blocks - 1) * self.units_per_block()
     }
 
@@ -194,7 +198,7 @@ impl RawMemoryFreeList {
     }
 
     fn mmap(&self, start: Address, bytes: usize) {
-        let res = super::memory::dzmmap_noreplace(start, bytes);
+        let res = super::memory::dzmmap_noreplace(start, bytes, self.strategy);
         assert!(res.is_ok(), "Can't get more space with mmap()");
     }
     pub fn get_limit(&self) -> Address {
@@ -269,6 +273,7 @@ mod tests {
             list_size as _,
             grain,
             1,
+            MmapStrategy::Normal,
         );
         // Grow the free-list to do the actual memory-mapping.
         l.grow_freelist(list_size as _);

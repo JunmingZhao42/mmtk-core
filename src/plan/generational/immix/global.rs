@@ -6,7 +6,6 @@ use crate::plan::global::BasePlan;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
-use crate::plan::global::GcStatus;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
@@ -29,20 +28,21 @@ use enum_map::EnumMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use mmtk_macros::PlanTraceObject;
+use mmtk_macros::{HasSpaces, PlanTraceObject};
 
 /// Generational immix. This implements the functionality of a two-generation copying
 /// collector where the higher generation is an immix space.
 /// See the PLDI'08 paper by Blackburn and McKinley for a description
 /// of the algorithm: <http://doi.acm.org/10.1145/1375581.1375586>.
-#[derive(PlanTraceObject)]
+#[derive(HasSpaces, PlanTraceObject)]
 pub struct GenImmix<VM: VMBinding> {
     /// Generational plan, which includes a nursery space and operations related with nursery.
-    #[fallback_trace]
+    #[parent]
     pub gen: CommonGenPlan<VM>,
     /// An immix space as the mature space.
     #[post_scan]
-    #[trace(CopySemantics::Mature)]
+    #[space]
+    #[copy_semantics(CopySemantics::Mature)]
     pub immix_space: ImmixSpace<VM>,
     /// Whether the last GC was a defrag GC for the immix space.
     pub last_gc_was_defrag: AtomicBool,
@@ -50,6 +50,7 @@ pub struct GenImmix<VM: VMBinding> {
     pub last_gc_was_full_heap: AtomicBool,
 }
 
+/// The plan constraints for the generational immix plan.
 pub const GENIMMIX_CONSTRAINTS: PlanConstraints = PlanConstraints {
     // The maximum object size that can be allocated without LOS is restricted by the max immix object size.
     // This might be too restrictive, as our default allocator is bump pointer (nursery allocator) which
@@ -65,8 +66,6 @@ pub const GENIMMIX_CONSTRAINTS: PlanConstraints = PlanConstraints {
 };
 
 impl<VM: VMBinding> Plan for GenImmix<VM> {
-    type VM = VM;
-
     fn constraints(&self) -> &'static PlanConstraints {
         &GENIMMIX_CONSTRAINTS
     }
@@ -98,12 +97,6 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         self.gen.collection_required(self, space_full, space)
     }
 
-    fn get_spaces(&self) -> Vec<&dyn Space<Self::VM>> {
-        let mut ret = self.gen.get_spaces();
-        ret.push(&self.immix_space);
-        ret
-    }
-
     // GenImmixMatureProcessEdges<VM, { TraceKind::Defrag }> and GenImmixMatureProcessEdges<VM, { TraceKind::Fast }>
     // are different types. However, it seems clippy does not recognize the constant type parameter and thinks we have identical blocks
     // in different if branches.
@@ -111,10 +104,6 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
     #[allow(clippy::branches_sharing_code)]
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<Self::VM>) {
         let is_full_heap = self.requires_full_heap_collection();
-
-        self.base().set_collection_kind::<Self>(self);
-        self.base().set_gc_status(GcStatus::GcPrepare);
-
         if !is_full_heap {
             debug!("Nursery GC");
             scheduler.schedule_common_work::<GenImmixNurseryGCWorkContext<VM>>(self);
@@ -135,7 +124,10 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         let full_heap = !self.gen.is_current_gc_nursery();
         self.gen.prepare(tls);
         if full_heap {
-            self.immix_space.prepare(full_heap);
+            self.immix_space.prepare(
+                full_heap,
+                crate::policy::immix::defrag::StatsForDefrag::new(self),
+            );
         }
     }
 
@@ -259,18 +251,7 @@ impl<VM: VMBinding> GenImmix<VM> {
             last_gc_was_full_heap: AtomicBool::new(false),
         };
 
-        // Use SideMetadataSanity to check if each spec is valid. This is also needed for check
-        // side metadata in extreme_assertions.
-        {
-            use crate::util::metadata::side_metadata::SideMetadataSanity;
-            let mut side_metadata_sanity_checker = SideMetadataSanity::new();
-            genimmix
-                .gen
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            genimmix
-                .immix_space
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-        }
+        genimmix.verify_side_metadata_sanity();
 
         genimmix
     }

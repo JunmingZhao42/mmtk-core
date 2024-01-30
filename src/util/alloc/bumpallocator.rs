@@ -1,11 +1,11 @@
-use super::allocator::{align_allocation_no_fill, fill_alignment_gap};
+use std::sync::Arc;
+
 use crate::util::Address;
 
 use crate::util::alloc::Allocator;
 
-use crate::plan::Plan;
 use crate::policy::space::Space;
-use crate::util::conversions::bytes_to_pages;
+use crate::util::conversions::bytes_to_pages_up;
 use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
 
@@ -13,44 +13,81 @@ const BYTES_IN_PAGE: usize = 1 << 12;
 const BLOCK_SIZE: usize = 8 * BYTES_IN_PAGE;
 const BLOCK_MASK: usize = BLOCK_SIZE - 1;
 
+/// A bump pointer allocator. It keeps a thread local allocation buffer,
+/// and bumps a cursor to allocate from the buffer.
 #[repr(C)]
 pub struct BumpAllocator<VM: VMBinding> {
     /// [`VMThread`] associated with this allocator instance
     pub tls: VMThread,
-    /// Current cursor for bump pointer
-    cursor: Address,
-    /// Limit for bump pointer
-    limit: Address,
+    /// Bump-pointer itself.
+    pub bump_pointer: BumpPointer,
     /// [`Space`](src/policy/space/Space) instance associated with this allocator instance.
     space: &'static dyn Space<VM>,
-    /// [`Plan`] instance that this allocator instance is associated with.
-    plan: &'static dyn Plan<VM = VM>,
+    pub(in crate::util::alloc) context: Arc<AllocatorContext<VM>>,
+}
+
+/// A common fast-path bump-pointer allocator shared across different allocator implementations
+/// that use bump-pointer allocation.
+/// A `BumpPointer` is always initialized with cursor = 0, limit = 0, so the first allocation
+/// always fails the check of `cursor + size < limit` and goes to the slowpath. A binding
+/// can also take advantage of this design to zero-initialize the a bump pointer.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BumpPointer {
+    /// The cursor inside the allocation buffer where the next object will be allocated.
+    pub cursor: Address,
+    /// The upperbound of the allocation buffer.
+    pub limit: Address,
+}
+
+impl BumpPointer {
+    /// Reset the cursor and limit to the given values.
+    pub fn reset(&mut self, start: Address, end: Address) {
+        self.cursor = start;
+        self.limit = end;
+    }
+}
+
+impl std::default::Default for BumpPointer {
+    /// Defaults to 0,0. In this case, the first
+    /// allocation would naturally fail the check
+    /// `cursor + size < limit`, and go to the slowpath.
+    fn default() -> Self {
+        BumpPointer {
+            cursor: Address::ZERO,
+            limit: Address::ZERO,
+        }
+    }
 }
 
 impl<VM: VMBinding> BumpAllocator<VM> {
-    pub fn set_limit(&mut self, start: Address, limit: Address) {
-        self.cursor = start;
-        self.limit = limit;
+    pub(crate) fn set_limit(&mut self, start: Address, limit: Address) {
+        self.bump_pointer.reset(start, limit);
     }
 
-    pub fn reset(&mut self) {
-        self.cursor = unsafe { Address::zero() };
-        self.limit = unsafe { Address::zero() };
+    pub(crate) fn reset(&mut self) {
+        let zero = unsafe { Address::zero() };
+        self.bump_pointer.reset(zero, zero);
     }
 
-    pub fn rebind(&mut self, space: &'static dyn Space<VM>) {
+    pub(crate) fn rebind(&mut self, space: &'static dyn Space<VM>) {
         self.reset();
         self.space = space;
     }
 }
+
+use crate::util::alloc::allocator::align_allocation_no_fill;
+use crate::util::alloc::fill_alignment_gap;
+
+use super::allocator::AllocatorContext;
 
 impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
     fn get_space(&self) -> &'static dyn Space<VM> {
         self.space
     }
 
-    fn get_plan(&self) -> &'static dyn Plan<VM = VM> {
-        self.plan
+    fn get_context(&self) -> &AllocatorContext<VM> {
+        &self.context
     }
 
     fn does_thread_local_allocation(&self) -> bool {
@@ -63,21 +100,21 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
 
     fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address {
         trace!("alloc");
-        let result = align_allocation_no_fill::<VM>(self.cursor, align, offset);
+        let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset);
         let new_cursor = result + size;
 
-        if new_cursor > self.limit {
+        if new_cursor > self.bump_pointer.limit {
             trace!("Thread local buffer used up, go to alloc slow path");
             self.alloc_slow(size, align, offset)
         } else {
-            fill_alignment_gap::<VM>(self.cursor, result);
-            self.cursor = new_cursor;
+            fill_alignment_gap::<VM>(self.bump_pointer.cursor, result);
+            self.bump_pointer.cursor = new_cursor;
             trace!(
                 "Bump allocation size: {}, result: {}, new_cursor: {}, limit: {}",
                 size,
                 result,
-                self.cursor,
-                self.limit
+                self.bump_pointer.cursor,
+                self.bump_pointer.limit
             );
             result
         }
@@ -108,24 +145,24 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
         }
 
         trace!("alloc_slow stress_test");
-        let result = align_allocation_no_fill::<VM>(self.cursor, align, offset);
+        let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset);
         let new_cursor = result + size;
 
         // For stress test, limit is [0, block_size) to artificially make the
         // check in the fastpath (alloc()) fail. The real limit is recovered by
         // adding it to the current cursor.
-        if new_cursor > self.cursor + self.limit.as_usize() {
+        if new_cursor > self.bump_pointer.cursor + self.bump_pointer.limit.as_usize() {
             self.acquire_block(size, align, offset, true)
         } else {
-            fill_alignment_gap::<VM>(self.cursor, result);
-            self.limit -= new_cursor - self.cursor;
-            self.cursor = new_cursor;
+            fill_alignment_gap::<VM>(self.bump_pointer.cursor, result);
+            self.bump_pointer.limit -= new_cursor - self.bump_pointer.cursor;
+            self.bump_pointer.cursor = new_cursor;
             trace!(
                 "alloc_slow: Bump allocation size: {}, result: {}, new_cursor: {}, limit: {}",
                 size,
                 result,
-                self.cursor,
-                self.limit
+                self.bump_pointer.cursor,
+                self.bump_pointer.limit
             );
             result
         }
@@ -137,17 +174,16 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
 }
 
 impl<VM: VMBinding> BumpAllocator<VM> {
-    pub fn new(
+    pub(crate) fn new(
         tls: VMThread,
         space: &'static dyn Space<VM>,
-        plan: &'static dyn Plan<VM = VM>,
+        context: Arc<AllocatorContext<VM>>,
     ) -> Self {
         BumpAllocator {
             tls,
-            cursor: unsafe { Address::zero() },
-            limit: unsafe { Address::zero() },
+            bump_pointer: BumpPointer::default(),
             space,
-            plan,
+            context,
         }
     }
 
@@ -158,8 +194,12 @@ impl<VM: VMBinding> BumpAllocator<VM> {
         offset: usize,
         stress_test: bool,
     ) -> Address {
+        if self.space.will_oom_on_acquire(self.tls, size) {
+            return Address::ZERO;
+        }
+
         let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
-        let acquired_start = self.space.acquire(self.tls, bytes_to_pages(block_size));
+        let acquired_start = self.space.acquire(self.tls, bytes_to_pages_up(block_size));
         if acquired_start.is_zero() {
             trace!("Failed to acquire a new block");
             acquired_start

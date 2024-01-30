@@ -93,7 +93,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         );
         let gc_controller = GCController::new(
             mmtk,
-            mmtk.plan.base().gc_requester.clone(),
+            mmtk.gc_requester.clone(),
             self.clone(),
             coordinator_worker,
         );
@@ -108,15 +108,11 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
     }
 
     /// Schedule all the common work packets
-    pub fn schedule_common_work<C: GCWorkContext<VM = VM> + 'static>(
-        &self,
-        plan: &'static C::PlanType,
-    ) {
+    pub fn schedule_common_work<C: GCWorkContext<VM = VM>>(&self, plan: &'static C::PlanType) {
         use crate::plan::Plan;
         use crate::scheduler::gc_work::*;
         // Stop & scan mutators (mutator scanning can happen before STW)
-        self.work_buckets[WorkBucketStage::Unconstrained]
-            .add(StopMutators::<C::ProcessEdgesWorkType>::new());
+        self.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<C>::new());
 
         // Prepare global/collectors/mutators
         self.work_buckets[WorkBucketStage::Prepare].add(Prepare::<C>::new(plan));
@@ -245,6 +241,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             let bucket_opened = bucket.update(self);
             buckets_updated = buckets_updated || bucket_opened;
             if bucket_opened {
+                probe!(mmtk, bucket_opened, id);
                 new_packets = new_packets || !bucket.is_drained();
                 if new_packets {
                     // Quit the loop. There are already new packets in the newly opened buckets.
@@ -398,7 +395,7 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
     }
 
     pub fn notify_mutators_paused(&self, mmtk: &'static MMTK<VM>) {
-        mmtk.plan.base().gc_requester.clear_request();
+        mmtk.gc_requester.clear_request();
         let first_stw_bucket = &self.work_buckets[WorkBucketStage::first_stw_stage()];
         debug_assert!(!first_stw_bucket.is_activated());
         // Note: This is the only place where a non-coordinator thread opens a bucket.

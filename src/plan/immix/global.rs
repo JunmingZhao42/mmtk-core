@@ -4,7 +4,6 @@ use crate::plan::global::BasePlan;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
-use crate::plan::global::GcStatus;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
@@ -16,7 +15,6 @@ use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::copy::*;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::side_metadata::SideMetadataContext;
-use crate::util::metadata::side_metadata::SideMetadataSanity;
 use crate::vm::VMBinding;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
@@ -24,31 +22,29 @@ use std::sync::atomic::AtomicBool;
 use atomic::Ordering;
 use enum_map::EnumMap;
 
-use mmtk_macros::PlanTraceObject;
+use mmtk_macros::{HasSpaces, PlanTraceObject};
 
-#[derive(PlanTraceObject)]
+#[derive(HasSpaces, PlanTraceObject)]
 pub struct Immix<VM: VMBinding> {
     #[post_scan]
-    #[trace(CopySemantics::DefaultCopy)]
+    #[space]
+    #[copy_semantics(CopySemantics::DefaultCopy)]
     pub immix_space: ImmixSpace<VM>,
-    #[fallback_trace]
+    #[parent]
     pub common: CommonPlan<VM>,
     last_gc_was_defrag: AtomicBool,
 }
 
+/// The plan constraints for the immix plan.
 pub const IMMIX_CONSTRAINTS: PlanConstraints = PlanConstraints {
     moves_objects: crate::policy::immix::DEFRAG,
-    gc_header_bits: 2,
-    gc_header_words: 0,
-    num_specialized_scans: 1,
-    /// Max immix object size is half of a block.
+    // Max immix object size is half of a block.
     max_non_los_default_alloc_bytes: crate::policy::immix::MAX_IMMIX_OBJECT_SIZE,
+    needs_prepare_mutator: false,
     ..PlanConstraints::default()
 };
 
 impl<VM: VMBinding> Plan for Immix<VM> {
-    type VM = VM;
-
     fn collection_required(&self, space_full: bool, _space: Option<&dyn Space<Self::VM>>) -> bool {
         self.base().collection_required(self, space_full)
     }
@@ -73,15 +69,7 @@ impl<VM: VMBinding> Plan for Immix<VM> {
         }
     }
 
-    fn get_spaces(&self) -> Vec<&dyn Space<Self::VM>> {
-        let mut ret = self.common.get_spaces();
-        ret.push(&self.immix_space);
-        ret
-    }
-
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
-        self.base().set_collection_kind::<Self>(self);
-        self.base().set_gc_status(GcStatus::GcPrepare);
         Self::schedule_immix_full_heap_collection::<
             Immix<VM>,
             ImmixGCWorkContext<VM, TRACE_KIND_FAST>,
@@ -95,7 +83,10 @@ impl<VM: VMBinding> Plan for Immix<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         self.common.prepare(tls, true);
-        self.immix_space.prepare(true);
+        self.immix_space.prepare(
+            true,
+            crate::policy::immix::defrag::StatsForDefrag::new(self),
+        );
     }
 
     fn release(&mut self, tls: VMWorkerThread) {
@@ -156,15 +147,7 @@ impl<VM: VMBinding> Immix<VM> {
             last_gc_was_defrag: AtomicBool::new(false),
         };
 
-        {
-            let mut side_metadata_sanity_checker = SideMetadataSanity::new();
-            immix
-                .common
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            immix
-                .immix_space
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-        }
+        immix.verify_side_metadata_sanity();
 
         immix
     }
@@ -173,18 +156,21 @@ impl<VM: VMBinding> Immix<VM> {
     /// to schedule a full heap collection. A plan must call set_collection_kind and set_gc_status before this method.
     pub(crate) fn schedule_immix_full_heap_collection<
         PlanType: Plan<VM = VM>,
-        FastContext: 'static + GCWorkContext<VM = VM, PlanType = PlanType>,
-        DefragContext: 'static + GCWorkContext<VM = VM, PlanType = PlanType>,
+        FastContext: GCWorkContext<VM = VM, PlanType = PlanType>,
+        DefragContext: GCWorkContext<VM = VM, PlanType = PlanType>,
     >(
         plan: &'static DefragContext::PlanType,
         immix_space: &ImmixSpace<VM>,
         scheduler: &GCWorkScheduler<VM>,
     ) {
         let in_defrag = immix_space.decide_whether_to_defrag(
-            plan.is_emergency_collection(),
+            plan.base().global_state.is_emergency_collection(),
             true,
-            plan.base().cur_collection_attempts.load(Ordering::SeqCst),
-            plan.base().is_user_triggered_collection(),
+            plan.base()
+                .global_state
+                .cur_collection_attempts
+                .load(Ordering::SeqCst),
+            plan.base().global_state.is_user_triggered_collection(),
             *plan.base().options.full_heap_system_gc,
         );
 

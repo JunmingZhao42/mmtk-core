@@ -21,7 +21,7 @@ use crate::util::ObjectReference;
 use crate::util::{conversions, metadata};
 use crate::vm::VMBinding;
 use crate::vm::{ActivePlan, Collection, ObjectModel};
-use crate::{policy::space::Space, util::heap::layout::vm_layout_constants::BYTES_IN_CHUNK};
+use crate::{policy::space::Space, util::heap::layout::vm_layout::BYTES_IN_CHUNK};
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -145,7 +145,7 @@ impl<VM: VMBinding> Space<VM> for MallocSpace<VM> {
         self.gc_trigger.as_ref()
     }
 
-    fn initialize_sft(&self) {
+    fn initialize_sft(&self, _sft_map: &mut dyn crate::policy::sft_map::SFTMap) {
         // Do nothing - we will set sft when we get new results from malloc
     }
 
@@ -400,9 +400,7 @@ impl<VM: VMBinding> MallocSpace<VM> {
         queue: &mut Q,
         object: ObjectReference,
     ) -> ObjectReference {
-        if object.is_null() {
-            return object;
-        }
+        debug_assert!(!object.is_null());
 
         assert!(
             self.in_space(object),

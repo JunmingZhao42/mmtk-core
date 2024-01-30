@@ -1,4 +1,3 @@
-use crate::plan::MutatorContext;
 use crate::util::alloc::AllocationError;
 use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
@@ -6,27 +5,34 @@ use crate::{scheduler::*, Mutator};
 
 /// Thread context for the spawned GC thread.  It is used by spawn_gc_thread.
 pub enum GCThreadContext<VM: VMBinding> {
+    /// The GC thread to spawn is a controller thread. There is only one controller thread.
     Controller(Box<GCController<VM>>),
+    /// The GC thread to spawn is a worker thread. There can be multiple worker threads.
     Worker(Box<GCWorker<VM>>),
 }
 
 /// VM-specific methods for garbage collection.
 pub trait Collection<VM: VMBinding> {
     /// Stop all the mutator threads. MMTk calls this method when it requires all the mutator to yield for a GC.
-    /// This method is called by a single thread in MMTk (the GC controller).
     /// This method should not return until all the threads are yielded.
     /// The actual thread synchronization mechanism is up to the VM, and MMTk does not make assumptions on that.
+    /// MMTk provides a callback function and expects the binding to use the callback for each mutator when it
+    /// is ready for stack scanning. Usually a stack can be scanned as soon as the thread stops in the yieldpoint.
     ///
     /// Arguments:
-    /// * `tls`: The thread pointer for the GC controller/coordinator.
+    /// * `tls`: The thread pointer for the GC worker.
+    /// * `mutator_visitor`: A callback.  Call it with a mutator as argument to notify MMTk that the mutator is ready to be scanned.
     fn stop_all_mutators<F>(tls: VMWorkerThread, mutator_visitor: F)
     where
         F: FnMut(&'static mut Mutator<VM>);
 
     /// Resume all the mutator threads, the opposite of the above. When a GC is finished, MMTk calls this method.
     ///
+    /// This method may not be called by the same GC thread that called `stop_all_mutators`.
+    ///
     /// Arguments:
-    /// * `tls`: The thread pointer for the GC controller/coordinator.
+    /// * `tls`: The thread pointer for the GC worker.  Currently it is the tls of the embedded `GCWorker` instance
+    /// of the coordinator thread, but it is subject to change, and should not be depended on.
     fn resume_mutators(tls: VMWorkerThread);
 
     /// Block the current thread for GC. This is called when an allocation request cannot be fulfilled and a GC
@@ -53,18 +59,6 @@ pub trait Collection<VM: VMBinding> {
     ///     The spawned thread shall call `memory_manager::start_worker`.
     ///   In either case, the `Box` inside should be passed back to the called function.
     fn spawn_gc_thread(tls: VMThread, ctx: GCThreadContext<VM>);
-
-    /// Allow VM-specific behaviors for a mutator after all the mutators are stopped and before any actual GC work starts.
-    ///
-    /// Arguments:
-    /// * `tls_worker`: The thread pointer for the worker thread performing this call.
-    /// * `tls_mutator`: The thread pointer for the target mutator thread.
-    /// * `m`: The mutator context for the thread.
-    fn prepare_mutator<T: MutatorContext<VM>>(
-        tls_worker: VMWorkerThread,
-        tls_mutator: VMMutatorThread,
-        m: &T,
-    );
 
     /// Inform the VM of an out-of-memory error. The binding should hook into the VM's error
     /// routine for OOM. Note that there are two different categories of OOM:
@@ -111,4 +105,38 @@ pub trait Collection<VM: VMBinding> {
     /// Arguments:
     /// * `tls_worker`: The thread pointer for the worker thread performing this call.
     fn post_forwarding(_tls: VMWorkerThread) {}
+
+    /// Return the amount of memory (in bytes) which the VM allocated outside the MMTk heap but
+    /// wants to include into the current MMTk heap size.  MMTk core will consider the reported
+    /// memory as part of MMTk heap for the purpose of heap size accounting.
+    ///
+    /// This amount should include memory that is kept alive by heap objects and can be released by
+    /// executing finalizers (or other language-specific cleaning-up routines) that are executed
+    /// when the heap objects are dead.  For example, if a language implementation allocates array
+    /// headers in the MMTk heap, but allocates their underlying buffers that hold the actual
+    /// elements using `malloc`, then those buffers should be included in this amount.  When the GC
+    /// finds such an array dead, its finalizer shall `free` the buffer and reduce this amount.
+    ///
+    /// If possible, the VM should account off-heap memory in pages.  That is, count the number of
+    /// pages occupied by off-heap objects, and report the number of bytes of those whole pages
+    /// instead of individual objects.  Because the underlying operating system manages memory at
+    /// page granularity, the occupied pages (instead of individual objects) determine the memory
+    /// footprint of a process, and how much memory MMTk spaces can obtain from the OS.
+    ///
+    /// However, if the VM is incapable of accounting off-heap memory in pages (for example, if the
+    /// VM uses `malloc` and the implementation of `malloc` is opaque to the VM), the VM binding
+    /// can simply return the total number of bytes of those off-heap objects as an approximation.
+    ///
+    /// # Performance note
+    ///
+    /// This function will be called when MMTk polls for GC.  It happens every time the MMTk
+    /// allocators have allocated a certain amount of memory, usually one or a few blocks.  Because
+    /// this function is called very frequently, its implementation must be efficient.  If it is
+    /// too expensive to compute the exact amount, an approximate value should be sufficient for
+    /// MMTk to trigger GC promptly in order to release off-heap memory, and keep the memory
+    /// footprint under control.
+    fn vm_live_bytes() -> usize {
+        // By default, MMTk assumes the amount of memory the VM allocates off-heap is negligible.
+        0
+    }
 }

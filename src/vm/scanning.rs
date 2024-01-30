@@ -26,11 +26,14 @@ impl<ES: Edge, F: FnMut(ES)> EdgeVisitor<ES> for F {
 
 /// Callback trait of scanning functions that directly trace through edges.
 pub trait ObjectTracer {
-    /// Call this function for the content of each edge,
-    /// and assign the returned value back to the edge.
+    /// Call this function to trace through an object graph edge which points to `object`.
+    /// `object` must point to a valid object, and cannot be `ObjectReference::NULL`.
     ///
-    /// Note: This function is performance-critical.
-    /// Implementations should consider inlining if necessary.
+    /// The return value is the new object reference for `object` if it is moved, or `object` if
+    /// not moved.  If moved, the caller should update the slot that holds the reference to
+    /// `object` so that it points to the new location.
+    ///
+    /// Note: This function is performance-critical, therefore must be implemented efficiently.
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference;
 }
 
@@ -105,30 +108,31 @@ pub trait RootsWorkFactory<ES: Edge>: Clone + Send + 'static {
     /// * `edges`: A vector of edges.
     fn create_process_edge_roots_work(&mut self, edges: Vec<ES>);
 
-    /// Create work packets to handle nodes pointed by root edges.
+    /// Create work packets to handle non-transitively pinning roots.
     ///
-    /// The work packet cannot update root edges, therefore it cannot move the objects.  This
-    /// method can only be used by GC algorithms that never moves objects, or GC algorithms that
-    /// supports object pinning.
+    /// The work packet will prevent the objects in `nodes` from moving,
+    /// i.e. they will be pinned for the duration of the GC.
+    /// But it will not prevent the children of those objects from moving.
     ///
     /// This method is useful for conservative stack scanning, or VMs that cannot update some
     /// of the root edges.
     ///
     /// Arguments:
     /// * `nodes`: A vector of references to objects pointed by root edges.
-    fn create_process_node_roots_work(&mut self, nodes: Vec<ObjectReference>);
+    fn create_process_pinning_roots_work(&mut self, nodes: Vec<ObjectReference>);
+
+    /// Create work packets to handle transitively pinning (TP) roots.
+    ///
+    /// Similar to `create_process_pinning_roots_work`, this work packet will not move objects in `nodes`.
+    /// Unlike ``create_process_pinning_roots_work`, no objects in the transitive closure of `nodes` will be moved, either.
+    ///
+    /// Arguments:
+    /// * `nodes`: A vector of references to objects pointed by root edges.
+    fn create_process_tpinning_roots_work(&mut self, nodes: Vec<ObjectReference>);
 }
 
 /// VM-specific methods for scanning roots/objects.
 pub trait Scanning<VM: VMBinding> {
-    /// Scan stack roots after all mutators are paused.
-    const SCAN_MUTATORS_IN_SAFEPOINT: bool = true;
-
-    /// Scan all the mutators within a single work packet.
-    ///
-    /// `SCAN_MUTATORS_IN_SAFEPOINT` should also be enabled
-    const SINGLE_THREAD_MUTATOR_SCANNING: bool = true;
-
     /// Return true if the given object supports edge enqueuing.
     ///
     /// -   If this returns true, MMTk core will call `scan_object` on the object.
@@ -203,20 +207,16 @@ pub trait Scanning<VM: VMBinding> {
     /// * `tls`: The GC thread that is performing the thread scan.
     fn notify_initial_thread_scan_complete(partial_scan: bool, tls: VMWorkerThread);
 
-    /// Scan all the mutators for roots.
+    /// Scan one mutator for stack roots.
     ///
-    /// The `memory_manager::is_mmtk_object` function can be used in this function if
-    /// -   the "is_mmtk_object" feature is enabled.
-    ///
-    /// Arguments:
-    /// * `tls`: The GC thread that is performing this scanning.
-    /// * `factory`: The VM uses it to create work packets for scanning roots.
-    fn scan_roots_in_all_mutator_threads(
-        tls: VMWorkerThread,
-        factory: impl RootsWorkFactory<VM::VMEdge>,
-    );
-
-    /// Scan one mutator for roots.
+    /// Some VM bindings may not be able to implement this method.
+    /// For example, the VM binding may only be able to enumerate all threads and
+    /// scan them while enumerating, but cannot scan stacks individually when given
+    /// the references of threads.
+    /// In that case, it can leave this method empty, and deal with stack
+    /// roots in [`Scanning::scan_vm_specific_roots`]. However, in that case, MMTk
+    /// does not know those roots are stack roots, and cannot perform any possible
+    /// optimization for the stack roots.
     ///
     /// The `memory_manager::is_mmtk_object` function can be used in this function if
     /// -   the "is_mmtk_object" feature is enabled.
@@ -245,6 +245,14 @@ pub trait Scanning<VM: VMBinding> {
     /// Return whether the VM supports return barriers. This is unused at the moment.
     fn supports_return_barrier() -> bool;
 
+    /// Prepare for another round of root scanning in the same GC. Some GC algorithms
+    /// need multiple transitive closures, and each transitive closure starts from
+    /// root scanning. We expect the binding to provide the same root set for every
+    /// round of root scanning in the same GC. Bindings can use this call to get
+    /// ready for another round of root scanning to make sure that the same root
+    /// set will be returned in the upcoming calls of root scanning methods,
+    /// such as [`crate::vm::Scanning::scan_roots_in_mutator_thread`] and
+    /// [`crate::vm::Scanning::scan_vm_specific_roots`].
     fn prepare_for_roots_re_scanning();
 
     /// Process weak references.
@@ -254,20 +262,33 @@ pub trait Scanning<VM: VMBinding> {
     /// MMTk core enables the VM binding to do the following in this function:
     ///
     /// 1.  Query if an object is already reached in this transitive closure.
-    /// 2.  Keep certain objects and their descendents alive.
-    /// 3.  Get the new address of objects that are either
-    ///     -   already alive before this function is called, or
-    ///     -   explicitly kept alive in this function.
+    /// 2.  Get the new address of an object if it is already reached.
+    /// 3.  Keep an object and its descendents alive if not yet reached.
     /// 4.  Request this function to be called again after transitive closure is finished again.
     ///
-    /// The VM binding can call `ObjectReference::is_reachable()` to query if an object is
-    /// currently reached.
+    /// The VM binding can query if an object is currently reached by calling
+    /// `ObjectReference::is_reachable()`.
     ///
-    /// The VM binding can use `tracer_factory` to get access to an `ObjectTracer`, and call
-    /// its `trace_object(object)` method to keep `object` and its decendents alive.
+    /// If an object is already reached, the VM binding can get its new address by calling
+    /// `ObjectReference::get_forwarded_object()` as the object may have been moved.
     ///
-    /// The return value of `ObjectTracer::trace_object(object)` is the new address of the given
-    /// `object` if it is moved by the GC.
+    /// If an object is not yet reached, the VM binding can keep that object and its descendents
+    /// alive.  To do this, the VM binding should use `tracer_context.with_tracer` to get access to
+    /// an `ObjectTracer`, and then call its `trace_object(object)` method.  The `trace_object`
+    /// method will return the new address of the `object` if it moved the object, or its original
+    /// address if not moved.  Implementation-wise, the `ObjectTracer` may contain an internal
+    /// queue for newly traced objects, and will flush the queue when `tracer_context.with_tracer`
+    /// returns. Therefore, it is recommended to reuse the `ObjectTracer` instance to trace
+    /// multiple objects.
+    ///
+    /// *Note that if `trace_object` is called on an already reached object, the behavior will be
+    /// equivalent to `ObjectReference::get_forwarded_object()`.  It will return the new address if
+    /// the GC already moved the object when tracing that object, or the original address if the GC
+    /// did not move the object when tracing it.  In theory, the VM binding can use `trace_object`
+    /// wherever `ObjectReference::get_forwarded_object()` is needed.  However, if a VM never
+    /// resurrects objects, it should completely avoid touching `tracer_context`, and exclusively
+    /// use `ObjectReference::get_forwarded_object()` to get new addresses of objects.  By doing
+    /// so, the VM binding can avoid accidentally resurrecting objects.*
     ///
     /// The VM binding can return `true` from `process_weak_refs` to request `process_weak_refs`
     /// to be called again after the MMTk core finishes transitive closure again from the objects
@@ -276,7 +297,7 @@ pub trait Scanning<VM: VMBinding> {
     ///
     /// Implementation-wise, this function is called as the "sentinel" of the `VMRefClosure` work
     /// bucket, which means it is called when all work packets in that bucket have finished.  The
-    /// `tracer_factory` expands the transitive closure by adding more work packets in the same
+    /// `tracer_context` expands the transitive closure by adding more work packets in the same
     /// bucket.  This means if `process_weak_refs` returns true, those work packets will have
     /// finished (completing the transitive closure) by the time `process_weak_refs` is called
     /// again.  The VM binding can make use of this by adding custom work packets into the

@@ -2,7 +2,6 @@ use super::gc_work::PPGCWorkContext;
 use super::mutator::ALLOCATOR_MAPPING;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
-use crate::plan::global::GcStatus;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
@@ -18,36 +17,29 @@ use crate::{
 };
 use enum_map::EnumMap;
 
-use mmtk_macros::PlanTraceObject;
+use mmtk_macros::{HasSpaces, PlanTraceObject};
 
-#[derive(PlanTraceObject)]
+#[derive(HasSpaces, PlanTraceObject)]
 pub struct PageProtect<VM: VMBinding> {
-    #[trace]
+    #[space]
     pub space: LargeObjectSpace<VM>,
+    #[parent]
     pub common: CommonPlan<VM>,
 }
 
+/// The plan constraints for the page protect plan.
 pub const CONSTRAINTS: PlanConstraints = PlanConstraints {
     moves_objects: false,
+    needs_prepare_mutator: false,
     ..PlanConstraints::default()
 };
 
 impl<VM: VMBinding> Plan for PageProtect<VM> {
-    type VM = VM;
-
     fn constraints(&self) -> &'static PlanConstraints {
         &CONSTRAINTS
     }
 
-    fn get_spaces(&self) -> Vec<&dyn Space<Self::VM>> {
-        let mut ret = self.common.get_spaces();
-        ret.push(&self.space);
-        ret
-    }
-
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
-        self.base().set_collection_kind::<Self>(self);
-        self.base().set_gc_status(GcStatus::GcPrepare);
         scheduler.schedule_common_work::<PPGCWorkContext<VM>>(self);
     }
 
@@ -114,16 +106,7 @@ impl<VM: VMBinding> PageProtect<VM> {
             common: CommonPlan::new(plan_args),
         };
 
-        // Use SideMetadataSanity to check if each spec is valid. This is also needed for check
-        // side metadata in extreme_assertions.
-        {
-            use crate::util::metadata::side_metadata::SideMetadataSanity;
-            let mut side_metadata_sanity_checker = SideMetadataSanity::new();
-            ret.common
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            ret.space
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-        }
+        ret.verify_side_metadata_sanity();
 
         ret
     }

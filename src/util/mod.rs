@@ -25,8 +25,9 @@ pub mod memory;
 pub mod opaque_pointer;
 /// MMTk command line options.
 pub mod options;
-/// Reference processing implementation.
-pub mod reference_processor;
+/// Test utilities. We need this module for `MockVM` in criterion benches, which does not include code with `cfg(test)`.
+#[cfg(any(test, feature = "mock_test"))]
+pub mod test_util;
 
 // The following modules are only public in the mmtk crate. They should only be used in MMTk core.
 /// An analysis framework for collecting data and profiling in GC.
@@ -35,12 +36,13 @@ pub(crate) mod analysis;
 /// Logging edges to check duplicated edges in GC.
 #[cfg(feature = "extreme_assertions")]
 pub(crate) mod edge_logger;
-/// Non-generic refs to generic types of <VM>.
+/// Non-generic refs to generic types of `<VM>`.
 pub(crate) mod erase_vm;
 /// Finalization implementation.
 pub(crate) mod finalizable_processor;
 /// Heap implementation, including page resource, mmapper, etc.
-pub(crate) mod heap;
+pub mod heap;
+/// Checking if an address is an valid MMTk object.
 #[cfg(feature = "is_mmtk_object")]
 pub mod is_mmtk_object;
 /// Logger initialization
@@ -51,6 +53,8 @@ pub mod malloc;
 pub mod metadata;
 /// Forwarding word in object copying.
 pub(crate) mod object_forwarding;
+/// Reference processing implementation.
+pub(crate) mod reference_processor;
 /// Utilities funcitons for Rust
 pub(crate) mod rust_util;
 /// Sanity checker for GC.
@@ -58,9 +62,6 @@ pub(crate) mod rust_util;
 pub(crate) mod sanity;
 /// Utils for collecting statistics.
 pub(crate) mod statistics;
-/// Test utilities.
-#[cfg(test)]
-pub(crate) mod test_util;
 /// A treadmill implementation.
 pub(crate) mod treadmill;
 
@@ -77,4 +78,3 @@ mod raw_memory_freelist;
 pub use self::address::Address;
 pub use self::address::ObjectReference;
 pub use self::opaque_pointer::*;
-pub use self::reference_processor::ReferenceProcessor;

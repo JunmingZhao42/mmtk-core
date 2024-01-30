@@ -8,7 +8,6 @@ use crate::plan::global::BasePlan;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
-use crate::plan::global::GcStatus;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
@@ -18,7 +17,6 @@ use crate::scheduler::*;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::copy::*;
 use crate::util::heap::VMRequest;
-use crate::util::metadata::side_metadata::SideMetadataSanity;
 use crate::util::Address;
 use crate::util::ObjectReference;
 use crate::util::VMWorkerThread;
@@ -27,24 +25,25 @@ use crate::ObjectQueue;
 use enum_map::EnumMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mmtk_macros::PlanTraceObject;
+use mmtk_macros::{HasSpaces, PlanTraceObject};
 
-#[derive(PlanTraceObject)]
+#[derive(HasSpaces, PlanTraceObject)]
 pub struct GenCopy<VM: VMBinding> {
-    #[fallback_trace]
+    #[parent]
     pub gen: CommonGenPlan<VM>,
     pub hi: AtomicBool,
-    #[trace(CopySemantics::Mature)]
+    #[space]
+    #[copy_semantics(CopySemantics::Mature)]
     pub copyspace0: CopySpace<VM>,
-    #[trace(CopySemantics::Mature)]
+    #[space]
+    #[copy_semantics(CopySemantics::Mature)]
     pub copyspace1: CopySpace<VM>,
 }
 
+/// The plan constraints for the generational copying plan.
 pub const GENCOPY_CONSTRAINTS: PlanConstraints = crate::plan::generational::GEN_CONSTRAINTS;
 
 impl<VM: VMBinding> Plan for GenCopy<VM> {
-    type VM = VM;
-
     fn constraints(&self) -> &'static PlanConstraints {
         &GENCOPY_CONSTRAINTS
     }
@@ -72,17 +71,8 @@ impl<VM: VMBinding> Plan for GenCopy<VM> {
         self.gen.collection_required(self, space_full, space)
     }
 
-    fn get_spaces(&self) -> Vec<&dyn Space<Self::VM>> {
-        let mut ret = self.gen.get_spaces();
-        ret.push(&self.copyspace0);
-        ret.push(&self.copyspace1);
-        ret
-    }
-
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
         let is_full_heap = self.requires_full_heap_collection();
-        self.base().set_collection_kind::<Self>(self);
-        self.base().set_gc_status(GcStatus::GcPrepare);
         if is_full_heap {
             scheduler.schedule_common_work::<GenCopyGCWorkContext<VM>>(self);
         } else {
@@ -227,17 +217,7 @@ impl<VM: VMBinding> GenCopy<VM> {
             copyspace1,
         };
 
-        // Use SideMetadataSanity to check if each spec is valid. This is also needed for check
-        // side metadata in extreme_assertions.
-        {
-            let mut side_metadata_sanity_checker = SideMetadataSanity::new();
-            res.gen
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            res.copyspace0
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-            res.copyspace1
-                .verify_side_metadata_sanity(&mut side_metadata_sanity_checker);
-        }
+        res.verify_side_metadata_sanity();
 
         res
     }

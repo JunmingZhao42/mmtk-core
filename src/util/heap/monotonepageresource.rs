@@ -1,11 +1,13 @@
-use super::layout::vm_layout_constants::{BYTES_IN_CHUNK, PAGES_IN_CHUNK};
+use super::layout::vm_layout::{BYTES_IN_CHUNK, PAGES_IN_CHUNK};
 use crate::policy::space::required_chunks;
 use crate::util::address::Address;
+use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::conversions::*;
+use std::ops::Range;
 use std::sync::{Mutex, MutexGuard};
 
 use crate::util::alloc::embedded_meta_data::*;
-use crate::util::heap::layout::vm_layout_constants::LOG_BYTES_IN_CHUNK;
+use crate::util::heap::layout::vm_layout::LOG_BYTES_IN_CHUNK;
 use crate::util::heap::pageresource::CommonPageResource;
 use crate::util::opaque_pointer::*;
 
@@ -57,7 +59,7 @@ impl<VM: VMBinding> PageResource<VM> for MonotonePageResource<VM> {
 
     fn get_available_physical_pages(&self) -> usize {
         let sync = self.sync.lock().unwrap();
-        let mut rtn = bytes_to_pages(sync.sentinel - sync.cursor);
+        let mut rtn = bytes_to_pages_up(sync.sentinel - sync.cursor);
         if !self.common.contiguous {
             rtn += self.common.vm_map.get_available_discontiguous_chunks() * PAGES_IN_CHUNK;
         }
@@ -138,6 +140,12 @@ impl<VM: VMBinding> PageResource<VM> for MonotonePageResource<VM> {
 
             /* In a contiguous space we can bump along into the next chunk, so preserve the currentChunk invariant */
             if self.common().contiguous && chunk_align_down(sync.cursor) != sync.current_chunk {
+                debug_assert!(
+                    chunk_align_down(sync.cursor) > sync.current_chunk,
+                    "Not monotonic.  chunk_align_down(sync.cursor): {}, sync.current_chunk: {}",
+                    chunk_align_down(sync.cursor),
+                    sync.current_chunk,
+                );
                 sync.current_chunk = chunk_align_down(sync.cursor);
             }
             self.commit_pages(reserved_pages, required_pages, tls);
@@ -253,22 +261,51 @@ impl<VM: VMBinding> MonotonePageResource<VM> {
      }
      }*/
 
-    pub fn reset_cursor(&self, _start: Address) {
+    pub fn reset_cursor(&self, top: Address) {
         if self.common.contiguous {
             let mut guard = self.sync.lock().unwrap();
-            let cursor = _start.align_up(crate::util::constants::BYTES_IN_PAGE);
-            let chunk = chunk_align_down(_start);
-            let start = match guard.conditional {
-                MonotonePageResourceConditional::Contiguous { start: _start, .. } => _start,
+            let cursor = top.align_up(crate::util::constants::BYTES_IN_PAGE);
+            let chunk = chunk_align_down(top);
+            let space_start = match guard.conditional {
+                MonotonePageResourceConditional::Contiguous { start, .. } => start,
                 _ => unreachable!(),
             };
-            let pages = bytes_to_pages(_start - start);
+            let pages = bytes_to_pages_up(top - space_start);
             self.common.accounting.reset();
             self.common.accounting.reserve_and_commit(pages);
             guard.current_chunk = chunk;
             guard.cursor = cursor;
         } else {
-            unimplemented!();
+            let mut chunk_start = self.common.get_head_discontiguous_region();
+            let mut release_regions = false;
+            let mut live_size = 0;
+            while !chunk_start.is_zero() {
+                let chunk_end = chunk_start
+                    + (self.common.vm_map.get_contiguous_region_chunks(chunk_start)
+                        << LOG_BYTES_IN_CHUNK);
+                let next_chunk_start = self.common.vm_map.get_next_contiguous_region(chunk_start);
+                if top >= chunk_start && top < chunk_end {
+                    // This is the last live chunk
+                    debug_assert!(!release_regions);
+                    let mut guard = self.sync.lock().unwrap();
+                    guard.current_chunk = chunk_start;
+                    guard.sentinel = chunk_end;
+                    guard.cursor = top.align_up(BYTES_IN_PAGE);
+                    live_size += top - chunk_start;
+                    // Release all the remaining regions
+                    release_regions = true;
+                } else if release_regions {
+                    // release this region
+                    self.common.release_discontiguous_chunks(chunk_start);
+                } else {
+                    // keep this live region
+                    live_size += chunk_end - chunk_start;
+                }
+                chunk_start = next_chunk_start;
+            }
+            let pages = bytes_to_pages_up(live_size);
+            self.common.accounting.reset();
+            self.common.accounting.reserve_and_commit(pages);
         }
     }
 
@@ -279,6 +316,7 @@ impl<VM: VMBinding> MonotonePageResource<VM> {
                 MonotonePageResourceConditional::Contiguous { start: _start, .. } => _start,
                 _ => unreachable!(),
             };
+            guard.current_chunk = guard.cursor;
         } else if !guard.cursor.is_zero() {
             let bytes = guard.cursor - guard.current_chunk;
             self.release_pages_extent(guard.current_chunk, bytes);
@@ -294,35 +332,52 @@ impl<VM: VMBinding> MonotonePageResource<VM> {
         }
     }
 
-    /// Iterate through allocated regions, and invoke the given function for each region.
-    pub fn for_allocated_regions<F>(&self, mut f: F)
-    where
-        F: FnMut(Address, usize),
-    {
+    /// Iterate over all contiguous memory regions in this space.
+    /// For contiguous space, this iterator should yield only once, and returning a contiguous memory region covering the whole space.
+    pub fn iterate_allocated_regions(&self) -> impl Iterator<Item = (Address, usize)> + '_ {
+        struct Iter<'a, VM: VMBinding> {
+            pr: &'a MonotonePageResource<VM>,
+            contiguous_space: Option<Range<Address>>,
+            discontiguous_start: Address,
+        }
+        impl<VM: VMBinding> Iterator for Iter<'_, VM> {
+            type Item = (Address, usize);
+            fn next(&mut self) -> Option<Self::Item> {
+                if let Some(range) = self.contiguous_space.take() {
+                    Some((range.start, range.end - range.start))
+                } else if self.discontiguous_start.is_zero() {
+                    None
+                } else {
+                    let start = self.discontiguous_start;
+                    self.discontiguous_start = self.pr.vm_map().get_next_contiguous_region(start);
+                    let size = self.pr.vm_map().get_contiguous_region_size(start);
+                    Some((start, size))
+                }
+            }
+        }
         let sync = self.sync.lock().unwrap();
         match sync.conditional {
             MonotonePageResourceConditional::Contiguous { start, .. } => {
-                let end = sync.cursor.align_up(BYTES_IN_CHUNK);
-                f(start, end - start);
+                let cursor = sync.cursor.align_up(BYTES_IN_CHUNK);
+                Iter {
+                    pr: self,
+                    contiguous_space: Some(start..cursor),
+                    discontiguous_start: Address::ZERO,
+                }
             }
             MonotonePageResourceConditional::Discontiguous => {
-                if !sync.cursor.is_zero() {
-                    f(sync.current_chunk, sync.cursor - sync.current_chunk);
-
-                    let mut chunk = self.vm_map().get_next_contiguous_region(sync.current_chunk);
-                    while !chunk.is_zero() {
-                        let size = self.vm_map().get_contiguous_region_size(chunk);
-                        f(chunk, size);
-
-                        chunk = self.vm_map().get_next_contiguous_region(chunk);
-                    }
+                let discontiguous_start = self.common.get_head_discontiguous_region();
+                Iter {
+                    pr: self,
+                    contiguous_space: None,
+                    discontiguous_start,
                 }
             }
         }
     }
 
     fn release_pages_extent(&self, _first: Address, bytes: usize) {
-        let pages = crate::util::conversions::bytes_to_pages(bytes);
+        let pages = crate::util::conversions::bytes_to_pages_up(bytes);
         debug_assert!(bytes == crate::util::conversions::pages_to_bytes(pages));
         // FIXME ZERO_PAGES_ON_RELEASE
         // FIXME Options.protectOnRelease

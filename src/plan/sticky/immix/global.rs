@@ -3,7 +3,6 @@ use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::immix;
-use crate::plan::GcStatus;
 use crate::plan::PlanConstraints;
 use crate::policy::immix::ImmixSpace;
 use crate::policy::sft::SFT;
@@ -21,20 +20,21 @@ use atomic::Ordering;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use mmtk_macros::PlanTraceObject;
+use mmtk_macros::{HasSpaces, PlanTraceObject};
 
 use super::gc_work::StickyImmixMatureGCWorkContext;
 use super::gc_work::StickyImmixNurseryGCWorkContext;
 
-#[derive(PlanTraceObject)]
+#[derive(HasSpaces, PlanTraceObject)]
 pub struct StickyImmix<VM: VMBinding> {
-    #[fallback_trace]
+    #[parent]
     immix: immix::Immix<VM>,
     gc_full_heap: AtomicBool,
     next_gc_full_heap: AtomicBool,
     full_heap_gc_count: Arc<Mutex<EventCounter>>,
 }
 
+/// The plan constraints for the sticky immix plan.
 pub const STICKY_IMMIX_CONSTRAINTS: PlanConstraints = PlanConstraints {
     moves_objects: crate::policy::immix::DEFRAG || crate::policy::immix::PREFER_COPY_ON_NURSERY_GC,
     needs_log_bit: true,
@@ -45,8 +45,6 @@ pub const STICKY_IMMIX_CONSTRAINTS: PlanConstraints = PlanConstraints {
 };
 
 impl<VM: VMBinding> Plan for StickyImmix<VM> {
-    type VM = VM;
-
     fn constraints(&self) -> &'static crate::plan::PlanConstraints {
         &STICKY_IMMIX_CONSTRAINTS
     }
@@ -82,9 +80,6 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
     }
 
     fn schedule_collection(&'static self, scheduler: &crate::scheduler::GCWorkScheduler<Self::VM>) {
-        self.base().set_collection_kind::<Self>(self);
-        self.base().set_gc_status(GcStatus::GcPrepare);
-
         let is_full_heap = self.requires_full_heap_collection();
         self.gc_full_heap.store(is_full_heap, Ordering::SeqCst);
 
@@ -104,10 +99,6 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
         }
     }
 
-    fn get_spaces(&self) -> Vec<&dyn crate::policy::space::Space<Self::VM>> {
-        self.immix.get_spaces()
-    }
-
     fn get_allocator_mapping(
         &self,
     ) -> &'static enum_map::EnumMap<crate::AllocationSemantics, crate::util::alloc::AllocatorSelector>
@@ -118,7 +109,10 @@ impl<VM: VMBinding> Plan for StickyImmix<VM> {
     fn prepare(&mut self, tls: crate::util::VMWorkerThread) {
         if self.is_current_gc_nursery() {
             // Prepare both large object space and immix space
-            self.immix.immix_space.prepare(false);
+            self.immix.immix_space.prepare(
+                false,
+                crate::policy::immix::defrag::StatsForDefrag::new(self),
+            );
             self.immix.common.los.prepare(false);
         } else {
             self.full_heap_gc_count.lock().unwrap().inc();
@@ -293,6 +287,7 @@ impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM> f
 
 impl<VM: VMBinding> StickyImmix<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        let full_heap_gc_count = args.stats.new_event_counter("majorGC", true, true);
         let plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &STICKY_IMMIX_CONSTRAINTS,
@@ -315,7 +310,6 @@ impl<VM: VMBinding> StickyImmix<VM> {
                 mixed_age: true,
             },
         );
-        let full_heap_gc_count = immix.base().stats.new_event_counter("majorGC", true, true);
         Self {
             immix,
             gc_full_heap: AtomicBool::new(false),
@@ -331,6 +325,7 @@ impl<VM: VMBinding> StickyImmix<VM> {
             .immix
             .common
             .base
+            .global_state
             .user_triggered_collection
             .load(Ordering::SeqCst)
             && *self.immix.common.base.options.full_heap_system_gc
@@ -342,6 +337,7 @@ impl<VM: VMBinding> StickyImmix<VM> {
                 .immix
                 .common
                 .base
+                .global_state
                 .cur_collection_attempts
                 .load(Ordering::SeqCst)
                 > 1

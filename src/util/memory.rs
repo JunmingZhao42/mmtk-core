@@ -2,21 +2,26 @@ use crate::util::alloc::AllocationError;
 use crate::util::opaque_pointer::*;
 use crate::util::Address;
 use crate::vm::{Collection, VMBinding};
+use bytemuck::NoUninit;
 use libc::{PROT_EXEC, PROT_NONE, PROT_READ, PROT_WRITE};
 use std::io::{Error, Result};
 use sysinfo::{RefreshKind, System, SystemExt};
 
-pub fn result_is_mapped(result: Result<()>) -> bool {
+/// Check the result from an mmap function in this module.
+/// Return true if the mmap has failed due to an existing conflicting mapping.
+pub(crate) fn result_is_mapped(result: Result<()>) -> bool {
     match result {
         Ok(_) => false,
         Err(err) => err.raw_os_error().unwrap() == libc::EEXIST,
     }
 }
 
+/// Set a range of memory to 0.
 pub fn zero(start: Address, len: usize) {
     set(start, 0, len);
 }
 
+/// Set a range of memory to the given value. Similar to memset.
 pub fn set(start: Address, val: u8, len: usize) {
     unsafe {
         std::ptr::write_bytes::<u8>(start.to_mut_ptr(), val, len);
@@ -33,10 +38,10 @@ pub fn set(start: Address, val: u8, len: usize) {
 /// the memory has been reserved by mmtk (e.g. after the use of mmap_noreserve()). Otherwise using this function
 /// may corrupt others' data.
 #[allow(clippy::let_and_return)] // Zeroing is not neceesary for some OS/s
-pub unsafe fn dzmmap(start: Address, size: usize) -> Result<()> {
+pub unsafe fn dzmmap(start: Address, size: usize, strategy: MmapStrategy) -> Result<()> {
     let prot = PROT_READ | PROT_WRITE | PROT_EXEC;
     let flags = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED;
-    let ret = mmap_fixed(start, size, prot, flags);
+    let ret = mmap_fixed(start, size, prot, flags, strategy);
     // We do not need to explicitly zero for Linux (memory is guaranteed to be zeroed)
     #[cfg(not(target_os = "linux"))]
     if ret.is_ok() {
@@ -52,14 +57,28 @@ const MMAP_FLAGS: libc::c_int = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_F
 // MAP_FIXED is used instead of MAP_FIXED_NOREPLACE (which is not available on macOS). We are at the risk of overwriting pre-existing mappings.
 const MMAP_FLAGS: libc::c_int = libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED;
 
+/// Strategy for performing mmap
+///
+/// This currently supports switching between different huge page allocation
+/// methods. However, this can later be refactored to reduce other code
+/// repetition.
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, NoUninit)]
+pub enum MmapStrategy {
+    /// The default mmap strategy.
+    Normal,
+    /// Enable transparent huge pages for the pages that are mapped. This option is only for linux.
+    TransparentHugePages,
+}
+
 /// Demand-zero mmap (no replace):
 /// This function mmaps the memory and guarantees to zero all mapped memory.
 /// This function will not overwrite existing memory mapping, and it will result Err if there is an existing mapping.
 #[allow(clippy::let_and_return)] // Zeroing is not neceesary for some OS/s
-pub fn dzmmap_noreplace(start: Address, size: usize) -> Result<()> {
+pub fn dzmmap_noreplace(start: Address, size: usize, strategy: MmapStrategy) -> Result<()> {
     let prot = PROT_READ | PROT_WRITE | PROT_EXEC;
     let flags = MMAP_FLAGS;
-    let ret = mmap_fixed(start, size, prot, flags);
+    let ret = mmap_fixed(start, size, prot, flags, strategy);
     // We do not need to explicitly zero for Linux (memory is guaranteed to be zeroed)
     #[cfg(not(target_os = "linux"))]
     if ret.is_ok() {
@@ -72,25 +91,43 @@ pub fn dzmmap_noreplace(start: Address, size: usize) -> Result<()> {
 /// This function does not reserve swap space for this mapping, which means there is no guarantee that writes to the
 /// mapping can always be successful. In case of out of physical memory, one may get a segfault for writing to the mapping.
 /// We can use this to reserve the address range, and then later overwrites the mapping with dzmmap().
-pub fn mmap_noreserve(start: Address, size: usize) -> Result<()> {
+pub fn mmap_noreserve(start: Address, size: usize, strategy: MmapStrategy) -> Result<()> {
     let prot = PROT_NONE;
     let flags = MMAP_FLAGS | libc::MAP_NORESERVE;
-    mmap_fixed(start, size, prot, flags)
+    mmap_fixed(start, size, prot, flags, strategy)
 }
 
-pub fn mmap_fixed(
+fn mmap_fixed(
     start: Address,
     size: usize,
     prot: libc::c_int,
     flags: libc::c_int,
+    strategy: MmapStrategy,
 ) -> Result<()> {
     let ptr = start.to_mut_ptr();
     wrap_libc_call(
         &|| unsafe { libc::mmap(start.to_mut_ptr(), size, prot, flags, -1, 0) },
         ptr,
-    )
+    )?;
+    match strategy {
+        MmapStrategy::Normal => Ok(()),
+        MmapStrategy::TransparentHugePages => {
+            #[cfg(target_os = "linux")]
+            {
+                wrap_libc_call(
+                    &|| unsafe { libc::madvise(start.to_mut_ptr(), size, libc::MADV_HUGEPAGE) },
+                    0,
+                )
+            }
+            // Setting the transparent hugepage option to true will not pass
+            // the validation on non-Linux OSes
+            #[cfg(not(target_os = "linux"))]
+            unreachable!()
+        }
+    }
 }
 
+/// Unmap the given memory (in page granularity). This wraps the unsafe libc munmap call.
 pub fn munmap(start: Address, size: usize) -> Result<()> {
     wrap_libc_call(&|| unsafe { libc::munmap(start.to_mut_ptr(), size) }, 0)
 }
@@ -129,13 +166,13 @@ pub fn handle_mmap_error<VM: VMBinding>(error: Error, tls: VMThread) -> ! {
 }
 
 /// Checks if the memory has already been mapped. If not, we panic.
-// Note that the checking has a side effect that it will map the memory if it was unmapped. So we panic if it was unmapped.
-// Be very careful about using this function.
+/// Note that the checking has a side effect that it will map the memory if it was unmapped. So we panic if it was unmapped.
+/// Be very careful about using this function.
 #[cfg(target_os = "linux")]
-pub fn panic_if_unmapped(start: Address, size: usize) {
+pub(crate) fn panic_if_unmapped(start: Address, size: usize) {
     let prot = PROT_READ | PROT_WRITE;
     let flags = MMAP_FLAGS;
-    match mmap_fixed(start, size, prot, flags) {
+    match mmap_fixed(start, size, prot, flags, MmapStrategy::Normal) {
         Ok(_) => panic!("{} of size {} is not mapped", start, size),
         Err(e) => {
             assert!(
@@ -147,13 +184,17 @@ pub fn panic_if_unmapped(start: Address, size: usize) {
     }
 }
 
+/// Checks if the memory has already been mapped. If not, we panic.
+/// This function is currently left empty for non-linux, and should be implemented in the future.
+/// As the function is only used for assertions, MMTk will still run even if we never panic.
 #[cfg(not(target_os = "linux"))]
-pub fn panic_if_unmapped(_start: Address, _size: usize) {
+pub(crate) fn panic_if_unmapped(_start: Address, _size: usize) {
     // This is only used for assertions, so MMTk will still run even if we never panic.
     // TODO: We need a proper implementation for this. As we do not have MAP_FIXED_NOREPLACE, we cannot use the same implementation as Linux.
     // Possibly we can use posix_mem_offset for both OS/s.
 }
 
+/// Unprotect the given memory (in page granularity) to allow access (PROT_READ/WRITE/EXEC).
 pub fn munprotect(start: Address, size: usize) -> Result<()> {
     wrap_libc_call(
         &|| unsafe { libc::mprotect(start.to_mut_ptr(), size, PROT_READ | PROT_WRITE | PROT_EXEC) },
@@ -161,6 +202,7 @@ pub fn munprotect(start: Address, size: usize) -> Result<()> {
     )
 }
 
+/// Protect the given memory (in page granularity) to forbid any access (PROT_NONE).
 pub fn mprotect(start: Address, size: usize) -> Result<()> {
     wrap_libc_call(
         &|| unsafe { libc::mprotect(start.to_mut_ptr(), size, PROT_NONE) },
@@ -224,10 +266,10 @@ mod tests {
         serial_test(|| {
             with_cleanup(
                 || {
-                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE) };
+                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE, MmapStrategy::Normal) };
                     assert!(res.is_ok());
                     // We can overwrite with dzmmap
-                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE) };
+                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE, MmapStrategy::Normal) };
                     assert!(res.is_ok());
                 },
                 || {
@@ -242,7 +284,7 @@ mod tests {
         serial_test(|| {
             with_cleanup(
                 || {
-                    let res = dzmmap_noreplace(START, BYTES_IN_PAGE);
+                    let res = dzmmap_noreplace(START, BYTES_IN_PAGE, MmapStrategy::Normal);
                     assert!(res.is_ok());
                     let res = munmap(START, BYTES_IN_PAGE);
                     assert!(res.is_ok());
@@ -261,10 +303,10 @@ mod tests {
             with_cleanup(
                 || {
                     // Make sure we mmapped the memory
-                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE) };
+                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE, MmapStrategy::Normal) };
                     assert!(res.is_ok());
                     // Use dzmmap_noreplace will fail
-                    let res = dzmmap_noreplace(START, BYTES_IN_PAGE);
+                    let res = dzmmap_noreplace(START, BYTES_IN_PAGE, MmapStrategy::Normal);
                     assert!(res.is_err());
                 },
                 || {
@@ -279,10 +321,10 @@ mod tests {
         serial_test(|| {
             with_cleanup(
                 || {
-                    let res = mmap_noreserve(START, BYTES_IN_PAGE);
+                    let res = mmap_noreserve(START, BYTES_IN_PAGE, MmapStrategy::Normal);
                     assert!(res.is_ok());
                     // Try reserve it
-                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE) };
+                    let res = unsafe { dzmmap(START, BYTES_IN_PAGE, MmapStrategy::Normal) };
                     assert!(res.is_ok());
                 },
                 || {
@@ -314,7 +356,7 @@ mod tests {
         serial_test(|| {
             with_cleanup(
                 || {
-                    assert!(dzmmap_noreplace(START, BYTES_IN_PAGE).is_ok());
+                    assert!(dzmmap_noreplace(START, BYTES_IN_PAGE, MmapStrategy::Normal).is_ok());
                     panic_if_unmapped(START, BYTES_IN_PAGE);
                 },
                 || {
@@ -332,7 +374,7 @@ mod tests {
             with_cleanup(
                 || {
                     // map 1 page from START
-                    assert!(dzmmap_noreplace(START, BYTES_IN_PAGE).is_ok());
+                    assert!(dzmmap_noreplace(START, BYTES_IN_PAGE, MmapStrategy::Normal).is_ok());
 
                     // check if the next page is mapped - which should panic
                     panic_if_unmapped(START + BYTES_IN_PAGE, BYTES_IN_PAGE);
@@ -354,7 +396,7 @@ mod tests {
             with_cleanup(
                 || {
                     // map 1 page from START
-                    assert!(dzmmap_noreplace(START, BYTES_IN_PAGE).is_ok());
+                    assert!(dzmmap_noreplace(START, BYTES_IN_PAGE, MmapStrategy::Normal).is_ok());
 
                     // check if the 2 pages from START are mapped. The second page is unmapped, so it should panic.
                     panic_if_unmapped(START, BYTES_IN_PAGE * 2);

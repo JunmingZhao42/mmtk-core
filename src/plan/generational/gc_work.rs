@@ -1,7 +1,7 @@
 use atomic::Ordering;
 
 use crate::plan::PlanTraceObject;
-use crate::scheduler::{gc_work::*, GCWork, GCWorker};
+use crate::scheduler::{gc_work::*, GCWork, GCWorker, WorkBucketStage};
 use crate::util::ObjectReference;
 use crate::vm::edge_shape::{Edge, MemorySlice};
 use crate::vm::*;
@@ -25,15 +25,19 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>> ProcessEdg
     type VM = VM;
     type ScanObjectsWorkType = PlanScanObjects<Self, P>;
 
-    fn new(edges: Vec<EdgeOf<Self>>, roots: bool, mmtk: &'static MMTK<VM>) -> Self {
-        let base = ProcessEdgesBase::new(edges, roots, mmtk);
+    fn new(
+        edges: Vec<EdgeOf<Self>>,
+        roots: bool,
+        mmtk: &'static MMTK<VM>,
+        bucket: WorkBucketStage,
+    ) -> Self {
+        let base = ProcessEdgesBase::new(edges, roots, mmtk, bucket);
         let plan = base.plan().downcast_ref().unwrap();
         Self { plan, base }
     }
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {
-        if object.is_null() {
-            return object;
-        }
+        debug_assert!(!object.is_null());
+
         // We cannot borrow `self` twice in a call, so we extract `worker` as a local variable.
         let worker = self.worker();
         self.plan
@@ -41,9 +45,16 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>> ProcessEdg
     }
     fn process_edge(&mut self, slot: EdgeOf<Self>) {
         let object = slot.load();
+        if object.is_null() {
+            return;
+        }
         let new_object = self.trace_object(object);
         debug_assert!(!self.plan.is_object_in_nursery(new_object));
-        slot.store(new_object);
+        // Note: If `object` is a mature object, `trace_object` will not call `space.trace_object`,
+        // but will still return `object`.  In that case, we don't need to write it back.
+        if new_object != object {
+            slot.store(new_object);
+        }
     }
 
     fn create_scan_work(
@@ -51,7 +62,7 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>> ProcessEdg
         nodes: Vec<ObjectReference>,
         roots: bool,
     ) -> Self::ScanObjectsWorkType {
-        PlanScanObjects::new(self.plan, nodes, false, roots)
+        PlanScanObjects::new(self.plan, nodes, false, roots, self.bucket)
     }
 }
 
@@ -102,11 +113,16 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessModBuf<E> {
             );
         }
         // scan modbuf only if the current GC is a nursery GC
-        if mmtk.plan.generational().unwrap().is_current_gc_nursery() {
+        if mmtk
+            .get_plan()
+            .generational()
+            .unwrap()
+            .is_current_gc_nursery()
+        {
             // Scan objects in the modbuf and forward pointers
             let modbuf = std::mem::take(&mut self.modbuf);
             GCWork::do_work(
-                &mut ScanObjects::<E>::new(modbuf, false, false),
+                &mut ScanObjects::<E>::new(modbuf, false, false, WorkBucketStage::Closure),
                 worker,
                 mmtk,
             )
@@ -135,7 +151,12 @@ impl<E: ProcessEdgesWork> ProcessRegionModBuf<E> {
 impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessRegionModBuf<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, mmtk: &'static MMTK<E::VM>) {
         // Scan modbuf only if the current GC is a nursery GC
-        if mmtk.plan.generational().unwrap().is_current_gc_nursery() {
+        if mmtk
+            .get_plan()
+            .generational()
+            .unwrap()
+            .is_current_gc_nursery()
+        {
             // Collect all the entries in all the slices
             let mut edges = vec![];
             for slice in &self.modbuf {
@@ -144,7 +165,11 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessRegionModBuf<E> {
                 }
             }
             // Forward entries
-            GCWork::do_work(&mut E::new(edges, false, mmtk), worker, mmtk)
+            GCWork::do_work(
+                &mut E::new(edges, false, mmtk, WorkBucketStage::Closure),
+                worker,
+                mmtk,
+            )
         }
     }
 }

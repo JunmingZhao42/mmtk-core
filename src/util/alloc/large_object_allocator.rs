@@ -1,4 +1,5 @@
-use crate::plan::Plan;
+use std::sync::Arc;
+
 use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::policy::space::Space;
 use crate::util::alloc::{allocator, Allocator};
@@ -6,14 +7,17 @@ use crate::util::opaque_pointer::*;
 use crate::util::Address;
 use crate::vm::VMBinding;
 
+use super::allocator::AllocatorContext;
+
+/// An allocator that only allocates at page granularity.
+/// This is intended for large objects.
 #[repr(C)]
 pub struct LargeObjectAllocator<VM: VMBinding> {
     /// [`VMThread`] associated with this allocator instance
     pub tls: VMThread,
     /// [`Space`](src/policy/space/Space) instance associated with this allocator instance.
     space: &'static LargeObjectSpace<VM>,
-    /// [`Plan`] instance that this allocator instance is associated with.
-    plan: &'static dyn Plan<VM = VM>,
+    context: Arc<AllocatorContext<VM>>,
 }
 
 impl<VM: VMBinding> Allocator<VM> for LargeObjectAllocator<VM> {
@@ -21,8 +25,8 @@ impl<VM: VMBinding> Allocator<VM> for LargeObjectAllocator<VM> {
         self.tls
     }
 
-    fn get_plan(&self) -> &'static dyn Plan<VM = VM> {
-        self.plan
+    fn get_context(&self) -> &AllocatorContext<VM> {
+        &self.context
     }
 
     fn get_space(&self) -> &'static dyn Space<VM> {
@@ -45,24 +49,26 @@ impl<VM: VMBinding> Allocator<VM> for LargeObjectAllocator<VM> {
     }
 
     fn alloc_slow_once(&mut self, size: usize, align: usize, _offset: usize) -> Address {
-        let header = 0; // HashSet is used instead of DoublyLinkedList
-        let maxbytes = allocator::get_maximum_aligned_size::<VM>(size + header, align);
-        let pages = crate::util::conversions::bytes_to_pages_up(maxbytes);
-        let sp = self.space.allocate_pages(self.tls, pages);
-        if sp.is_zero() {
-            sp
-        } else {
-            sp + header
+        if self.space.will_oom_on_acquire(self.tls, size) {
+            return Address::ZERO;
         }
+
+        let maxbytes = allocator::get_maximum_aligned_size::<VM>(size, align);
+        let pages = crate::util::conversions::bytes_to_pages_up(maxbytes);
+        self.space.allocate_pages(self.tls, pages)
     }
 }
 
 impl<VM: VMBinding> LargeObjectAllocator<VM> {
-    pub fn new(
+    pub(crate) fn new(
         tls: VMThread,
         space: &'static LargeObjectSpace<VM>,
-        plan: &'static dyn Plan<VM = VM>,
+        context: Arc<AllocatorContext<VM>>,
     ) -> Self {
-        LargeObjectAllocator { tls, space, plan }
+        LargeObjectAllocator {
+            tls,
+            space,
+            context,
+        }
     }
 }

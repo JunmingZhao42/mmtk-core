@@ -1,5 +1,7 @@
 use atomic::Ordering;
 
+use crate::global_state::GlobalState;
+use crate::plan::gc_requester::GCRequester;
 use crate::plan::Plan;
 use crate::policy::space::Space;
 use crate::util::conversions;
@@ -8,6 +10,7 @@ use crate::vm::VMBinding;
 use crate::MMTK;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 /// GCTrigger is responsible for triggering GCs based on the given policy.
 /// All the decisions about heap limit and GC triggering should be resolved here.
@@ -19,10 +22,17 @@ pub struct GCTrigger<VM: VMBinding> {
     plan: MaybeUninit<&'static dyn Plan<VM = VM>>,
     /// The triggering policy.
     pub policy: Box<dyn GCTriggerPolicy<VM>>,
+    gc_requester: Arc<GCRequester<VM>>,
+    options: Arc<Options>,
+    state: Arc<GlobalState>,
 }
 
 impl<VM: VMBinding> GCTrigger<VM> {
-    pub fn new(options: &Options) -> Self {
+    pub fn new(
+        options: Arc<Options>,
+        gc_requester: Arc<GCRequester<VM>>,
+        state: Arc<GlobalState>,
+    ) -> Self {
         GCTrigger {
             plan: MaybeUninit::uninit(),
             policy: match *options.gc_trigger {
@@ -35,6 +45,9 @@ impl<VM: VMBinding> GCTrigger<VM> {
                 )),
                 GCTriggerSelector::Delegated => unimplemented!(),
             },
+            options,
+            gc_requester,
+            state,
         }
     }
 
@@ -64,10 +77,21 @@ impl<VM: VMBinding> GCTrigger<VM> {
                 plan.get_reserved_pages(),
                 plan.get_total_pages(),
             );
-            plan.base().gc_requester.request();
+            self.gc_requester.request();
             return true;
         }
         false
+    }
+
+    pub fn should_do_stress_gc(&self) -> bool {
+        Self::should_do_stress_gc_inner(&self.state, &self.options)
+    }
+
+    /// Check if we should do a stress GC now. If GC is initialized and the allocation bytes exceeds
+    /// the stress factor, we should do a stress GC.
+    pub(crate) fn should_do_stress_gc_inner(state: &GlobalState, options: &Options) -> bool {
+        state.is_initialized()
+            && (state.allocation_bytes.load(Ordering::SeqCst) > *options.stress_factor)
     }
 
     /// Check if the heap is full
@@ -103,9 +127,11 @@ pub trait GCTriggerPolicy<VM: VMBinding>: Sync + Send {
         plan: &dyn Plan<VM = VM>,
     ) -> bool;
     /// Is current heap full?
-    fn is_heap_full(&self, plan: &'static dyn Plan<VM = VM>) -> bool;
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool;
     /// Return the current heap size (in pages)
-    fn get_heap_size_in_pages(&self) -> usize;
+    fn get_current_heap_size_in_pages(&self) -> usize;
+    /// Return the upper bound of heap size
+    fn get_max_heap_size_in_pages(&self) -> usize;
     /// Can the heap size grow?
     fn can_heap_size_grow(&self) -> bool;
 }
@@ -125,12 +151,16 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for FixedHeapSizeTrigger {
         plan.collection_required(space_full, space)
     }
 
-    fn is_heap_full(&self, plan: &'static dyn Plan<VM = VM>) -> bool {
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
         // If reserved pages is larger than the total pages, the heap is full.
         plan.get_reserved_pages() > self.total_pages
     }
 
-    fn get_heap_size_in_pages(&self) -> usize {
+    fn get_current_heap_size_in_pages(&self) -> usize {
+        self.total_pages
+    }
+
+    fn get_max_heap_size_in_pages(&self) -> usize {
         self.total_pages
     }
 
@@ -178,7 +208,7 @@ struct MemBalancerStats {
     allocation_pages: f64,
     /// Allocation duration in secs
     allocation_time: f64,
-    /// Collected memory in pages
+    /// Collected memory in pages (memory traversed during collection)
     collection_pages: f64,
     /// Collection duration in secs
     collection_time: f64,
@@ -259,9 +289,8 @@ impl MemBalancerStats {
     ) -> bool {
         if !plan.is_current_gc_nursery() {
             self.gc_end_live_pages = plan.get_mature_reserved_pages();
-            self.collection_pages = self
-                .gc_release_live_pages
-                .saturating_sub(self.gc_end_live_pages) as f64;
+            // Use live pages as an estimate for pages traversed during GC
+            self.collection_pages = self.gc_end_live_pages as f64;
             trace!(
                 "collected pages = mature live at gc end {} - mature live at gc release {} = {}",
                 self.gc_release_live_pages,
@@ -280,26 +309,25 @@ impl MemBalancerStats {
 
     fn non_generational_mem_stats_on_gc_start<VM: VMBinding>(&mut self, mmtk: &'static MMTK<VM>) {
         self.allocation_pages = mmtk
-            .plan
+            .get_plan()
             .get_reserved_pages()
             .saturating_sub(self.gc_end_live_pages) as f64;
         trace!(
             "allocated pages = used {} - live in last gc {} = {}",
-            mmtk.plan.get_reserved_pages(),
+            mmtk.get_plan().get_reserved_pages(),
             self.gc_end_live_pages,
             self.allocation_pages
         );
     }
     fn non_generational_mem_stats_on_gc_release<VM: VMBinding>(&mut self, mmtk: &'static MMTK<VM>) {
-        self.gc_release_live_pages = mmtk.plan.get_reserved_pages();
+        self.gc_release_live_pages = mmtk.get_plan().get_reserved_pages();
         trace!("live before release = {}", self.gc_release_live_pages);
     }
     fn non_generational_mem_stats_on_gc_end<VM: VMBinding>(&mut self, mmtk: &'static MMTK<VM>) {
-        self.gc_end_live_pages = mmtk.plan.get_reserved_pages();
+        self.gc_end_live_pages = mmtk.get_plan().get_reserved_pages();
         trace!("live pages = {}", self.gc_end_live_pages);
-        self.collection_pages = self
-            .gc_release_live_pages
-            .saturating_sub(self.gc_end_live_pages) as f64;
+        // Use live pages as an estimate for pages traversed during GC
+        self.collection_pages = self.gc_end_live_pages as f64;
         trace!(
             "collected pages = live at gc end {} - live at gc release {} = {}",
             self.gc_release_live_pages,
@@ -310,6 +338,16 @@ impl MemBalancerStats {
 }
 
 impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
+    fn is_gc_required(
+        &self,
+        space_full: bool,
+        space: Option<&dyn Space<VM>>,
+        plan: &dyn Plan<VM = VM>,
+    ) -> bool {
+        // Let the plan decide
+        plan.collection_required(space_full, space)
+    }
+
     fn on_pending_allocation(&self, pages: usize) {
         self.pending_pages.fetch_add(pages, Ordering::SeqCst);
     }
@@ -325,7 +363,7 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
                 stats.allocation_time
             );
 
-            if let Some(plan) = mmtk.plan.generational() {
+            if let Some(plan) = mmtk.get_plan().generational() {
                 stats.generational_mem_stats_on_gc_start(plan);
             } else {
                 stats.non_generational_mem_stats_on_gc_start(mmtk);
@@ -336,7 +374,7 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
     fn on_gc_release(&self, mmtk: &'static MMTK<VM>) {
         trace!("=== on_gc_release ===");
         self.access_stats(|stats| {
-            if let Some(plan) = mmtk.plan.generational() {
+            if let Some(plan) = mmtk.get_plan().generational() {
                 stats.generational_mem_stats_on_gc_release(plan);
             } else {
                 stats.non_generational_mem_stats_on_gc_release(mmtk);
@@ -355,13 +393,13 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
                 stats.collection_time
             );
 
-            if let Some(plan) = mmtk.plan.generational() {
+            if let Some(plan) = mmtk.get_plan().generational() {
                 if stats.generational_mem_stats_on_gc_end(plan) {
                     self.compute_new_heap_limit(
-                        mmtk.plan.get_reserved_pages(),
+                        mmtk.get_plan().get_reserved_pages(),
                         // We reserve an extra of min nursery. This ensures that we will not trigger
                         // a full heap GC in the next GC (if available pages is smaller than min nursery, we will force a full heap GC)
-                        mmtk.plan.get_collection_reserved_pages()
+                        mmtk.get_plan().get_collection_reserved_pages()
                             + mmtk.options.get_min_nursery_pages(),
                         stats,
                     );
@@ -369,8 +407,8 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
             } else {
                 stats.non_generational_mem_stats_on_gc_end(mmtk);
                 self.compute_new_heap_limit(
-                    mmtk.plan.get_reserved_pages(),
-                    mmtk.plan.get_collection_reserved_pages(),
+                    mmtk.get_plan().get_reserved_pages(),
+                    mmtk.get_plan().get_collection_reserved_pages(),
                     stats,
                 );
             }
@@ -379,23 +417,17 @@ impl<VM: VMBinding> GCTriggerPolicy<VM> for MemBalancerTrigger {
         self.pending_pages.store(0, Ordering::SeqCst);
     }
 
-    fn is_gc_required(
-        &self,
-        space_full: bool,
-        space: Option<&dyn Space<VM>>,
-        plan: &dyn Plan<VM = VM>,
-    ) -> bool {
-        // Let the plan decide
-        plan.collection_required(space_full, space)
-    }
-
-    fn is_heap_full(&self, plan: &'static dyn Plan<VM = VM>) -> bool {
+    fn is_heap_full(&self, plan: &dyn Plan<VM = VM>) -> bool {
         // If reserved pages is larger than the current heap size, the heap is full.
         plan.get_reserved_pages() > self.current_heap_pages.load(Ordering::Relaxed)
     }
 
-    fn get_heap_size_in_pages(&self) -> usize {
+    fn get_current_heap_size_in_pages(&self) -> usize {
         self.current_heap_pages.load(Ordering::Relaxed)
+    }
+
+    fn get_max_heap_size_in_pages(&self) -> usize {
+        self.max_heap_pages
     }
 
     fn can_heap_size_grow(&self) -> bool {

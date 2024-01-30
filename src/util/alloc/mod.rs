@@ -1,4 +1,4 @@
-///! Various allocators implementation.
+//! Various allocators implementation.
 
 /// The allocator trait and allocation-related functions.
 pub(crate) mod allocator;
@@ -8,11 +8,13 @@ pub use allocator::Allocator;
 
 /// A list of all the allocators, embedded in Mutator
 pub(crate) mod allocators;
+pub use allocators::AllocatorInfo;
 pub use allocators::AllocatorSelector;
 
 /// Bump pointer allocator
 mod bumpallocator;
 pub use bumpallocator::BumpAllocator;
+pub use bumpallocator::BumpPointer;
 
 mod large_object_allocator;
 pub use large_object_allocator::LargeObjectAllocator;
@@ -25,7 +27,7 @@ pub use malloc_allocator::MallocAllocator;
 pub mod immix_allocator;
 pub use self::immix_allocator::ImmixAllocator;
 
-// Free list allocator based on Mimalloc
+/// Free list allocator based on Mimalloc
 pub mod free_list_allocator;
 pub use free_list_allocator::FreeListAllocator;
 
