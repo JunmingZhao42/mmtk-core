@@ -176,6 +176,11 @@ impl<VM: VMBinding> CopySpace<VM> {
     }
 
     pub fn release(&self) {
+        #[cfg(feature = "immix_zero_on_release")]
+        for (start, size) in self.pr.iterate_allocated_regions() {
+            crate::util::memory::zero(start, size);
+        }
+
         unsafe {
             #[cfg(feature = "vo_bit")]
             self.reset_vo_bit();
