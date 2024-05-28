@@ -44,6 +44,7 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>>
     fn flush_modbuf(&mut self) {
         let buf = self.modbuf.take();
         if !buf.is_empty() {
+            VM::remembered_set_flush(&buf);
             self.mmtk.scheduler.work_buckets[WorkBucketStage::Closure]
                 .add(ProcessModBuf::<GenNurseryProcessEdges<VM, P>>::new(buf));
         }
