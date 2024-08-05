@@ -41,6 +41,9 @@ pub(crate) mod erase_vm;
 pub(crate) mod finalizable_processor;
 /// Heap implementation, including page resource, mmapper, etc.
 pub mod heap;
+/// Debugging tool for heap dump.
+#[cfg(feature = "heap_dump_dot")]
+pub mod heap_dump_dot;
 /// Checking if an address is an valid MMTk object.
 #[cfg(feature = "is_mmtk_object")]
 pub mod is_mmtk_object;
